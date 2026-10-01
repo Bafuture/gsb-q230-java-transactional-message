@@ -30,3 +30,25 @@ Pair-wise GSB 标注任务仓库（第 15 批 / 230）。
 1. 在本仓库中完成提示词要求的全部内容。
 2. `./mvnw -q verify` 必须通过。
 3. 完成后在所属分支（A 或 B）上提交，产物快照的父提交必须是初始环境快照。
+
+## 实现说明（分支 B）
+
+本地消息表（transactional outbox）组件位于 `com.example.txmsg`，无任何第三方运行时依赖。
+
+| 类 | 职责 |
+|----|------|
+| `TransactionalDatabase` | 持有业务存储与消息表，`inTransaction(...)` 提供单一提交点：业务数据与消息暂存（staging），提交时一起可见、异常时一起回滚 |
+| `BusinessStore` / `MessageStore` | 两个内存存储，消息表即“本地消息表”；消息在提交时获得单调递增的产生序号 |
+| `OutboxMessage` / `MessageStatus` | 消息行与状态机：`PENDING → SENT`，失败超限为 `DEAD`（人工处理，记录原因） |
+| `MessageRelay` | 单线程后台轮询器：投递到期消息、指数退避重试（`base * 2^(attempts-1)`）、超限转 DEAD |
+| `DeduplicatingConsumer` | 幂等消费包装：按消息 ID 去重，at-least-once 重投时效果至多生效一次 |
+| `OutboxStats` / `TimingStats` | 统计快照：待发/已发/死信数、总投递次数、重试次数、失败次数，以及 PENDING 等待、SENT 投递、DEAD 失败各状态耗时 |
+
+关键语义：
+
+- **原子性**：事务串行化 + 两存储同一提交点，杜绝“数据写了、消息没发”。
+- **顺序**：同一 `businessKey` 按序号投递；前面的消息未 SENT（重试中或 DEAD）会阻塞后续同键消息，不同业务键互不阻塞。
+- **重启恢复**：消息表是持久介质，新的 relay 实例基于表中状态继续投递；SENT 不重投，PENDING 接着退避计划重试，已用重试次数不重置。
+- **投递语义**：at-least-once（应用成功但标记前崩溃会重投），故下游必须幂等。
+
+测试（16 个，`src/test/java/com/example/txmsg/`）：事务原子性 4、后台投递 2、退避重试/死信 2、幂等消费 2（含“应用后崩溃”重投去重）、重启恢复 2（含重启中途重试）、顺序保证 2、统计 2。
